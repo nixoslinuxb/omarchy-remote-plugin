@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Pointer and buttons for omarchy-remote.
+
+- Movement is a Hyprland cursor warp: absolute coordinates land exactly where
+  the phone's finger is. Sending it over Hyprland's own IPC socket keeps a drag
+  responsive (a `hyprctl` process per move would lag by ~100 ms).
+- Buttons are a virtual uinput mouse, so press/hold/drag works like a real one.
+
+Requests on the unix socket (one JSON object per connection):
+
+    {"op": "move", "x": 0.0-1.0, "y": 0.0-1.0}
+    {"op": "click", "button": "left"|"middle"|"right"}
+    {"op": "down",  "button": "..."}
+    {"op": "up",    "button": "..."}
+"""
+
+import fcntl
+import json
+import os
+import socket
+import struct
+import time
+
+UI_DEV_SETUP = 0x405C5503
+UI_DEV_CREATE = 0x5501
+UI_DEV_DESTROY = 0x5502
+UI_SET_EVBIT = 0x40045564
+UI_SET_KEYBIT = 0x40045565
+
+EV_SYN, EV_KEY = 0x00, 0x01
+SYN_REPORT = 0
+BTN_LEFT, BTN_MIDDLE, BTN_RIGHT = 0x110, 0x112, 0x111
+BUS_VIRTUAL = 0x06
+
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "omarchy-remote")
+SOCKET = os.path.join(RUNTIME, "pointer.sock")
+PIDFILE = os.path.join(RUNTIME, "pointer.pid")
+BUTTONS = {"left": BTN_LEFT, "middle": BTN_MIDDLE, "right": BTN_RIGHT}
+
+
+def pid_matches(pid, needle):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return needle in cmdline
+
+
+def already_running():
+    try:
+        pid = int(open(PIDFILE, encoding="utf-8").read().strip())
+        os.kill(pid, 0)
+        return pid_matches(pid, "omarchy-remote-pointer")
+    except (OSError, ValueError):
+        return False
+
+
+def hypr_socket():
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    if not signature:
+        return None
+    path = os.path.join(runtime, "hypr", signature, ".socket.sock")
+    return path if os.path.exists(path) else None
+
+
+class Hypr:
+    """Tiny Hyprland IPC client: one request per connection, no process spawn."""
+
+    def __init__(self):
+        self.path = hypr_socket()
+        self.size = (1920, 1080, 0, 0)
+
+    def request(self, command):
+        if not self.path:
+            return None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+                client.settimeout(1.5)
+                client.connect(self.path)
+                client.sendall(command.encode())
+                chunks = []
+                while True:
+                    data = client.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+            return b"".join(chunks).decode("utf-8", "replace")
+        except OSError:
+            return None
+
+    def move(self, fx, fy):
+        """Warp the pointer to a fraction of the focused monitor."""
+        width, height, origin_x, origin_y = 1920, 1080, 0, 0
+        raw = self.request("j/monitors")
+        if raw:
+            try:
+                monitors = json.loads(raw)
+            except ValueError:
+                monitors = []
+            chosen = None
+            for monitor in monitors:
+                if monitor.get("focused"):
+                    chosen = monitor
+                    break
+            if chosen is None and monitors:
+                chosen = monitors[0]
+            if chosen:
+                width = int(chosen.get("width", width))
+                height = int(chosen.get("height", height))
+                origin_x = int(chosen.get("x", 0))
+                origin_y = int(chosen.get("y", 0))
+
+        px = origin_x + int(max(0.0, min(1.0, fx)) * (width - 1))
+        py = origin_y + int(max(0.0, min(1.0, fy)) * (height - 1))
+        result = self.request(
+            "eval hl.dispatch(hl.dsp.cursor.move({x=%d,y=%d}))" % (px, py)
+        )
+        return result, px, py
+
+    def move_by(self, dx, dy):
+        """Move relative to the current cursor position.
+
+        Hyprland's Lua API only exposes absolute cursor placement, so read the
+        current position and add the delta.
+        """
+        raw = self.request("j/cursorpos")
+        try:
+            position = json.loads(raw) if raw else {}
+            x = int(position.get("x", 0)) + dx
+            y = int(position.get("y", 0)) + dy
+        except (TypeError, ValueError):
+            return None
+        return self.request(
+            "eval hl.dispatch(hl.dsp.cursor.move({x=%d,y=%d}))" % (x, y)
+        )
+
+
+def open_device():
+    fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+    # Buttons only: no relative axes, so this device can never nudge the cursor.
+    for event in (EV_KEY, EV_SYN):
+        fcntl.ioctl(fd, UI_SET_EVBIT, event)
+    for button in BUTTONS.values():
+        fcntl.ioctl(fd, UI_SET_KEYBIT, button)
+
+    ident = struct.pack("HHHH", BUS_VIRTUAL, 0x1209, 0x0abd, 1)
+    name = b"omarchy-remote-buttons".ljust(80, b"\0")
+    fcntl.ioctl(fd, UI_DEV_SETUP, ident + name + struct.pack("I", 0))
+    fcntl.ioctl(fd, UI_DEV_CREATE)
+    return fd
+
+
+def emit(fd, event_type, code, value):
+    os.write(fd, struct.pack("llHHi", 0, 0, event_type, code, value))
+
+
+def read_request(connection):
+    """Read one newline-terminated JSON object from a stream socket."""
+    data = bytearray()
+    while len(data) <= 65536:
+        chunk = connection.recv(4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if b"\n" in chunk:
+            break
+    line = bytes(data).split(b"\n", 1)[0]
+    return json.loads(line.decode("utf-8")) if line else {}
+
+
+def main():
+    os.makedirs(RUNTIME, exist_ok=True)
+    if already_running():
+        return
+
+    try:
+        os.unlink(SOCKET)
+    except FileNotFoundError:
+        pass
+
+    fd = open_device()
+    hypr = Hypr()
+    time.sleep(0.5)
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET)
+    os.chmod(SOCKET, 0o600)
+    server.listen(16)
+    with open(PIDFILE, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+
+    try:
+        while True:
+            connection, _ = server.accept()
+            with connection:
+                try:
+                    connection.settimeout(2.0)
+                    request = read_request(connection)
+                except (ValueError, OSError):
+                    try:
+                        connection.sendall(b'{"ok":false}\n')
+                    except OSError:
+                        pass
+                    continue
+                if not isinstance(request, dict):
+                    request = {}
+
+                op = request.get("op")
+                reply = {"ok": False}
+
+                try:
+                    if op == "move":
+                        x = float(request.get("x", 0.5))
+                        y = float(request.get("y", 0.5))
+                        result, px, py = hypr.move(x, y)
+                        reply = {"ok": result is not None, "x": px, "y": py}
+                    elif op == "move_by":
+                        result = hypr.move_by(
+                            int(request.get("dx", 0)),
+                            int(request.get("dy", 0)),
+                        )
+                        reply = {"ok": result is not None}
+                    else:
+                        button = BUTTONS.get(str(request.get("button", "left")), BTN_LEFT)
+                        if op == "down":
+                            emit(fd, EV_KEY, button, 1)
+                            emit(fd, EV_SYN, SYN_REPORT, 0)
+                            reply = {"ok": True}
+                        elif op == "up":
+                            emit(fd, EV_KEY, button, 0)
+                            emit(fd, EV_SYN, SYN_REPORT, 0)
+                            reply = {"ok": True}
+                        elif op == "click":
+                            emit(fd, EV_KEY, button, 1)
+                            emit(fd, EV_SYN, SYN_REPORT, 0)
+                            time.sleep(0.04)
+                            emit(fd, EV_KEY, button, 0)
+                            emit(fd, EV_SYN, SYN_REPORT, 0)
+                            reply = {"ok": True}
+                except (OSError, TypeError, ValueError):
+                    reply = {"ok": False}
+
+                try:
+                    connection.sendall(json.dumps(reply).encode() + b"\n")
+                except OSError:
+                    pass
+    finally:
+        fcntl.ioctl(fd, UI_DEV_DESTROY)
+        os.close(fd)
+        for path in (SOCKET, PIDFILE):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "yhcramo.remote",
+  "name": "Phone Remote",
+  "version": "1.0.0",
+  "author": "yhcramo",
+  "description": "Control this computer from an Android phone: media, trackpad, keyboard, clipboard, files and messaging notifications over a paired LAN connection",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Phone Remote",
+    "description": "Media, trackpad, clipboard and messages from a paired phone",
+    "category": "System",
+    "allowMultiple": false
+  }
+}

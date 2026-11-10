@@ -1,0 +1,1735 @@
+#!/usr/bin/python3
+"""omarchy-remote — media remote service for phones.
+
+Controls this computer's media from a phone on the same Wi-Fi:
+
+  * play / pause, next / previous, seek ±10 s
+  * volume up / down / mute
+  * album art
+
+Security:
+  * HTTPS (a fresh self-signed certificate + fingerprint on every start)
+  * QR pairing; the token lives in the URL fragment (#), never sent over the wire
+  * binds to the LAN interface only, not to every address
+  * restarting the service rotates certificate and token -> pair again
+
+Usage:
+  omarchy-remote start [--port 8765] [--bind IP]
+  omarchy-remote stop
+  omarchy-remote status
+  omarchy-remote pair        (pairing URL + terminal QR)
+"""
+
+import argparse
+import json
+import os
+import re
+import secrets
+import shutil
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from gi.repository import Gio, GLib
+
+APP = "omarchy-remote"
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), APP)
+STATE_FILE = os.path.join(RUNTIME, "state.json")
+CERT_FILE = os.path.join(RUNTIME, "cert.pem")
+KEY_FILE = os.path.join(RUNTIME, "key.pem")
+QR_FILE = os.path.join(RUNTIME, "pair.png")
+PID_FILE = os.path.join(RUNTIME, "pid")
+LOG_FILE = os.path.join(RUNTIME, "service.log")
+
+DEFAULT_PORT = 8765
+ART_MAX_BYTES = 2 * 1024 * 1024
+# JSON requests are small except the notification batch, which can carry 50
+# messages of up to 500 characters each.
+JSON_MAX_BYTES = 256 * 1024
+LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------
+# helpers
+# --------------------------------------------------------------------------
+
+def ensure_runtime():
+    os.makedirs(RUNTIME, exist_ok=True)
+    os.chmod(RUNTIME, 0o700)
+
+
+def require_platform():
+    """This service targets Omarchy on Wayland only; refuse anything else."""
+    problems = []
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        problems.append("WAYLAND_DISPLAY is not set — a Wayland session is required")
+    if not os.path.isdir("/usr/share/omarchy"):
+        problems.append("/usr/share/omarchy not found — Omarchy is required")
+    if problems:
+        for problem in problems:
+            print(f"{APP}: {problem}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def lan_ip():
+    """Local IP from the default route. Sends no packets."""
+    try:
+        out = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"],
+                             capture_output=True, text=True, timeout=3).stdout
+        match = re.search(r"src\s+(\d+\.\d+\.\d+\.\d+)", out)
+        if match:
+            return match.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            match = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if match:
+                return match.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "127.0.0.1"
+
+
+def fingerprint(cert_path):
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-fingerprint", "-sha256"],
+        capture_output=True, text=True, check=True).stdout
+    value = out.split("=", 1)[1].strip()
+    return value
+
+
+def make_cert():
+    ensure_runtime()
+    for path in (CERT_FILE, KEY_FILE):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "ec",
+         "-pkeyopt", "ec_paramgen_curve:prime256v1",
+         "-keyout", KEY_FILE, "-out", CERT_FILE,
+         "-days", "1", "-nodes",
+         "-subj", "/CN=omarchy-remote",
+         "-addext", "subjectAltName=IP:127.0.0.1"],
+        check=True, capture_output=True)
+    os.chmod(KEY_FILE, 0o600)
+    return fingerprint(CERT_FILE)
+
+
+def make_qr(url, fingerprint_value):
+    if not shutil.which("qrencode"):
+        return None
+    payload = f"{url}#t={Config.token}&f={fingerprint_value}"
+    subprocess.run(["qrencode", "-o", QR_FILE, "-s", "7", "-m", "3", payload],
+                   check=True)
+    return QR_FILE
+
+
+# --------------------------------------------------------------------------
+# MPRIS
+# --------------------------------------------------------------------------
+
+class Media:
+    def __init__(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+    def _names(self):
+        try:
+            out = subprocess.run(["busctl", "--user", "list", "--no-legend"],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except (OSError, subprocess.SubprocessError) as error:
+            print(f"omarchy-remote: busctl failed: {error}", flush=True)
+            return []
+        names = []
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            name = parts[0]
+            # Firefox publishes its own name (org.mozilla.firefox.<base64>) in
+            # addition to the legacy org.mpris.MediaPlayer2.firefox.<instance>.
+            if name.startswith(("org.mpris.MediaPlayer2", "org.mozilla.firefox")):
+                names.append(name)
+        print(f"omarchy-remote: players seen: {len(names)}", flush=True)
+        return names
+
+    @staticmethod
+    def _identity(name):
+        # Browsers append a per-window suffix, in several shapes:
+        #   Firefox / Zen: .instance_1_75
+        #   Chromium forks (Helium, Chrome, Brave): .instance12345
+        #   mpv: .instance-GPhWddZj
+        # Group every window of one application under a single identity.
+        if name.startswith(("org.mozilla.firefox", "org.mpris.MediaPlayer2.firefox")):
+            return "org.mozilla.firefox"
+        if name.startswith(("org.mozilla.zen", "org.mpris.MediaPlayer2.zen")):
+            return "org.mozilla.zen"
+        marker = name.find(".instance")
+        return name[:marker] if marker > 0 else name
+
+    def _props(self, name):
+        try:
+            res = self.bus.call_sync(
+                name, "/org/mpris/MediaPlayer2",
+                "org.freedesktop.DBus.Properties", "GetAll",
+                GLib.Variant("(s)", ("org.mpris.MediaPlayer2.Player",)),
+                GLib.VariantType("(a{sv})"), Gio.DBusCallFlags.NONE, 2000, None)
+            return res.unpack()[0]
+        except GLib.Error as error:
+            print(f"omarchy-remote: props failed for {name}: {error.message}", flush=True)
+            return None
+
+    def players(self):
+        found = []
+        for name in self._names():
+            props = self._props(name)
+            if props is None:
+                continue
+            metadata = props.get("Metadata") or {}
+            artists = metadata.get("xesam:artist") or []
+            found.append({
+                "id": name,
+                "app": self._identity(name),
+                "status": props.get("PlaybackStatus", "Stopped"),
+                "title": metadata.get("xesam:title") or "",
+                "artist": ", ".join(a for a in artists if a),
+                "album": metadata.get("xesam:album") or "",
+                "art": metadata.get("mpris:artUrl") or "",
+                "length": int(metadata.get("mpris:length") or 0),
+                "position": int(props.get("Position") or 0),
+                "canNext": bool(props.get("CanGoNext")),
+                "canPrev": bool(props.get("CanGoPrevious")),
+                "canPlay": bool(props.get("CanPlay")),
+                "canPause": bool(props.get("CanPause")),
+                "canSeek": bool(props.get("CanSeek")),
+            })
+        return found
+
+    def active(self):
+        players = self.players()
+        if not players:
+            return None
+
+        def score(item):
+            value = 0
+            if item["status"] == "Playing":
+                value += 4
+            elif item["status"] == "Paused":
+                value += 2
+            if item["art"]:
+                value += 3
+            if item["artist"]:
+                value += 2
+            if item["album"]:
+                value += 1
+            if item["title"]:
+                value += 1
+            if item["position"] > 0:
+                value += 2
+            if item.get("length"):
+                value += 3            # real media beats a browser stub
+
+            # Browsers (Firefox, Zen, Chromium forks like Helium) publish a
+            # placeholder entry even with nothing playing. Firefox says
+            # "<Browser> is playing media"; Chromium forks often repeat the
+            # application name as the title.
+            title = item["title"].strip().lower()
+            if title.endswith("is playing media"):
+                value -= 6
+            app_leaf = item["app"].rsplit(".", 1)[-1].lower()
+            if title and title in ("", app_leaf, item["app"].lower()):
+                value -= 5
+
+            if item["id"] == LAST_PLAYER["id"]:
+                value += 1
+            return value
+
+        # One entry per application: several Chromium windows each publish a
+        # player, and only the most interesting one should represent the app.
+        best_per_app = {}
+        for item in players:
+            key = item["app"]
+            current = best_per_app.get(key)
+            if current is None or score(item) > score(current):
+                best_per_app[key] = item
+
+        best = max(best_per_app.values(), key=score)
+        LAST_PLAYER["id"] = best["id"]
+        return best
+
+    def position_of(self, name):
+        try:
+            res = self.bus.call_sync(
+                name, "/org/mpris/MediaPlayer2",
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", "Position")),
+                GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 800, None)
+            return int(res.unpack()[0])
+        except GLib.Error:
+            return 0
+
+    def set_position(self, name, position_us):
+        """Seek relative to the current position.
+
+        MPRIS nominally allows writing Position, but several players (mpv,
+        Haruna) ignore it, so a relative Seek is the portable path.
+        """
+        try:
+            res = self.bus.call_sync(
+                name, "/org/mpris/MediaPlayer2",
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", ("org.mpris.MediaPlayer2.Player", "Position")),
+                GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 1200, None)
+            current = int(res.unpack()[0])
+        except GLib.Error:
+            current = 0
+        delta = int(position_us) - current
+        if abs(delta) < 50_000:
+            return True
+        return self.call(name, "Seek", GLib.Variant("(x)", (delta,)))
+
+    def call(self, name, method, args=None):
+        try:
+            self.bus.call_sync(
+                name, "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player", method,
+                args or GLib.Variant("()", ()),
+                GLib.VariantType("()"), Gio.DBusCallFlags.NONE, 1500, None)
+            return True
+        except GLib.Error:
+            return False
+
+
+MEDIA = Media()
+LAST_PLAYER = {"id": None}
+# When the user picks a player on the phone it sticks until that player is gone.
+SELECTED = {"id": None, "app": None}
+
+# Per player: True once we have ever seen its position advance. A player that has
+# proved it moves is trusted for the rest of the session — even if a seek briefly
+# reports position 0 while it buffers, or the track loops back to the start.
+SEEK_TRUSTED = {}
+SEEK_SUSPECT_SINCE = {}
+
+
+def player_label(item):
+    """A short, human name for the player row in the phone's picker."""
+    app = item["app"]
+    leaf = app.rsplit(".", 1)[-1]
+    if app.startswith("org.mozilla.firefox"):
+        return "Firefox"
+    if app.startswith("org.mozilla.zen"):
+        return "Zen"
+    known = {
+        "firefox": "Firefox",
+        "zen": "Zen",
+        "chromium": "Chromium",
+        "helium": "Helium",
+        "chrome": "Chrome",
+        "brave": "Brave",
+        "vivaldi": "Vivaldi",
+        "mpv": "mpv",
+        "haruna": "Haruna",
+        "vlc": "VLC",
+        "spotify": "Spotify",
+        "rhythmbox": "Rhythmbox",
+    }
+    return known.get(leaf.lower(), leaf.capitalize())
+
+
+def all_players():
+    """Every player MPRIS exposes, de-duplicated per tab/window."""
+    players = MEDIA.players()
+    seen = {}
+    for item in players:
+        # Chromium windows share an identity but have distinct titles; keep each
+        # so the phone can tell two tabs apart.
+        key = (item["app"], item["title"], item["status"])
+        if key in seen:
+            continue
+        item["label"] = player_label(item)
+        seen[key] = item
+    return list(seen.values())
+
+
+def current_player():
+    """The player commands should go to: the phone's pick, else the best one."""
+    players = all_players()
+    if not players:
+        return None
+    if SELECTED["id"]:
+        chosen = next((p for p in players if p["id"] == SELECTED["id"]), None)
+        if chosen is not None:
+            return chosen
+    if SELECTED["app"]:
+        chosen = next((p for p in players if p["app"] == SELECTED["app"]), None)
+        if chosen is not None:
+            SELECTED["id"] = chosen["id"]
+            return chosen
+    chosen = MEDIA.active()
+    if chosen is not None:
+        SELECTED["id"] = chosen["id"]
+        SELECTED["app"] = chosen["app"]
+    return chosen
+
+
+def media_state():
+    players = all_players()
+    chosen = None
+    if SELECTED["id"]:
+        chosen = next((p for p in players if p["id"] == SELECTED["id"]), None)
+    if chosen is None and SELECTED["app"]:
+        # The player published a new instance name (a new tab or a new video);
+        # keep driving the same application.
+        chosen = next((p for p in players if p["app"] == SELECTED["app"]), None)
+        if chosen is not None:
+            SELECTED["id"] = chosen["id"]
+    if chosen is None:
+        SELECTED["id"] = None
+        SELECTED["app"] = None
+        chosen = MEDIA.active()
+    if chosen is None:
+        return {"player": None, "players": [], "selected": None}
+
+    chosen["hasArt"] = chache_art(chosen["id"], chosen["art"])
+
+    player_id = chosen["id"]
+    position = chosen.get("position") or 0
+
+    if position > 0:
+        SEEK_TRUSTED[player_id] = True
+        SEEK_SUSPECT_SINCE.pop(player_id, None)
+    elif not chosen.get("length"):
+        # No duration at all: live stream or a browser placeholder.
+        SEEK_TRUSTED[player_id] = False
+
+    # A player that advertises CanSeek but has never moved is a browser media
+    # session stub: it reports a duration yet keeps Position at 0 forever, so a
+    # seek would appear to do nothing. Only distrust it after a few seconds, and
+    # only until it proves otherwise.
+    if not SEEK_TRUSTED.get(player_id):
+        if chosen.get("status") == "Playing" and chosen.get("length"):
+            since = SEEK_SUSPECT_SINCE.setdefault(player_id, time.time())
+            chosen["canSeek"] = (time.time() - since) < 5
+        else:
+            SEEK_SUSPECT_SINCE.pop(player_id, None)
+            chosen["canSeek"] = False
+    # GetAll omits Position; a live read keeps the seek bar honest.
+    chosen["position"] = MEDIA.position_of(chosen["id"])
+    chosen["canSeek"] = bool(chosen.get("canSeek"))
+    rows = [
+        {
+            "id": p["id"],
+            "label": p["label"],
+            "title": p["title"],
+            "artist": p["artist"],
+            "status": p["status"],
+            "selected": p["id"] == chosen["id"],
+        }
+        for p in players
+    ]
+    return {"player": chosen, "players": rows, "selected": chosen["id"]}
+
+
+# --------------------------------------------------------------------------
+# album art
+# --------------------------------------------------------------------------
+
+ART_CACHE = {"key": None, "mime": None, "data": None}
+
+
+def chache_art(player_id, art_url):
+    if not art_url:
+        return False
+    key = f"{player_id}|{art_url}"
+    if ART_CACHE["key"] == key and ART_CACHE["data"]:
+        return True
+
+    data, mime = None, None
+    try:
+        if art_url.startswith("data:"):
+            header, _, payload = art_url.partition(",")
+            if ";base64" not in header:
+                return False
+            import base64
+            data = base64.b64decode(payload, validate=False)
+            if len(data) > ART_MAX_BYTES:
+                return False
+            mime = header[5:].split(";")[0] or "image/jpeg"
+        elif art_url.startswith("file://"):
+            path = urllib.request.url2pathname(art_url[len("file://"):])
+            if os.path.getsize(path) <= ART_MAX_BYTES:
+                with open(path, "rb") as handle:
+                    data = handle.read(ART_MAX_BYTES + 1)
+                mime = "image/jpeg"
+        elif art_url.startswith(("http://", "https://")):
+            request = urllib.request.Request(art_url, headers={"User-Agent": APP})
+            with urllib.request.urlopen(request, timeout=2) as response:
+                data = response.read(ART_MAX_BYTES + 1)
+                mime = response.headers.get("Content-Type", "image/jpeg")
+    except (OSError, ValueError):
+        return False
+
+    if not data or len(data) > ART_MAX_BYTES:
+        return False
+
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif data[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        mime = "image/webp"
+
+    ART_CACHE.update({"key": key, "mime": mime or "image/jpeg", "data": data})
+    return True
+
+
+# --------------------------------------------------------------------------
+# ses
+# --------------------------------------------------------------------------
+
+def wpctl(*args):
+    try:
+        return subprocess.run(["wpctl", *args], capture_output=True, text=True,
+                              timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def volume_state():
+    out = wpctl("get-volume", "@DEFAULT_AUDIO_SINK@")
+    muted = "[MUTED]" in out
+    match = re.search(r"Volume:\s+([0-9.]+)", out)
+    volume = round(float(match.group(1)) * 100) if match else 0
+    return {"volume": volume, "muted": muted}
+
+
+def set_clipboard(text):
+    """Put text on the Wayland clipboard. Omarchy only, so wl-copy is present."""
+    if not shutil.which("wl-copy"):
+        return False
+    try:
+        result = subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"],
+                                input=text.encode("utf-8"), timeout=5)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+POINTER_SOCKET = os.path.join(RUNTIME, "pointer.sock")
+POINTER_PID = os.path.join(RUNTIME, "pointer.pid")
+
+
+def _pointer_bin():
+    """Prefer the pointer daemon next to this script (plugin install)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    sibling = os.path.join(here, "omarchy-remote-pointer")
+    if os.path.exists(sibling):
+        return sibling
+    return os.path.join(os.path.expanduser("~"), ".local", "bin",
+                        "omarchy-remote-pointer")
+
+
+POINTER_BIN = _pointer_bin()
+
+UPLOAD_DIR_NAME = "omarchy-remote"
+OUTBOX_DIR = os.path.join(os.environ.get("XDG_STATE_HOME",
+                                         os.path.expanduser("~/.local/state")),
+                          "omarchy-remote", "outbox")
+CLIPBOARD_OUT = os.path.join(RUNTIME, "clipboard-out.txt")
+
+
+def safe_filename(name, fallback="file"):
+    name = os.path.basename(name or "").strip()
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in '/\\\0')
+    name = name.lstrip(".")
+    if not name:
+        name = fallback
+    if len(name) > 120:
+        stem, dot, ext = name.rpartition(".")
+        name = (stem[:100] + dot + ext[:16]) if dot and len(ext) <= 16 else name[:120]
+    return name
+
+
+def upload_target(name):
+    # Everything the phone sends lands in one place: ~/Documents/omarchy-remote.
+    # O_EXCL reserves the name atomically, so two uploads with the same name
+    # cannot both pick the same target and overwrite each other.
+    base = os.path.join(os.path.expanduser("~"), "Documents", UPLOAD_DIR_NAME)
+    os.makedirs(base, exist_ok=True)
+    stem, dot, ext = name.rpartition(".")
+    counter = 0
+    while counter < 10000:
+        suffix = f"-{counter}" if counter else ""
+        target = os.path.join(base, (stem + suffix + dot + ext) if dot else (name + suffix))
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            return target, fd
+        except FileExistsError:
+            counter += 1
+    raise OSError("too many files with the same name")
+
+
+NOTIFICATIONS_FILE = os.path.join(RUNTIME, "notifications.json")
+# The bar plugin reads this file and draws the cards itself, so the reply box can
+# live inside the notification instead of a separate window.
+NOTIFICATIONS_LIVE = os.path.join(RUNTIME, "notifications-live.json")
+NOTIFY_ACTIONS_FILE = os.path.join(RUNTIME, "notify-actions.json")
+MUTE_FILE = os.path.join(RUNTIME, "notifications-muted")
+DISCONNECT_FILE = os.path.join(RUNTIME, "disconnected")
+# The HTTP server is threaded: the phone's periodic push and the bar's reply can
+# rewrite these files at the same time.
+NOTIFY_LOCK = threading.RLock()
+
+
+def pid_matches(pid, needle):
+    """True when /proc/<pid>/cmdline belongs to the expected program.
+
+    PID files survive crashes and the runtime tmpfs can be reused; without this
+    check a recycled PID would let stop signal an unrelated process.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            cmdline = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    return needle in cmdline
+
+
+def pointer_running():
+    try:
+        pid = int(open(POINTER_PID, encoding="utf-8").read().strip())
+        os.kill(pid, 0)
+        if not pid_matches(pid, "omarchy-remote-pointer"):
+            return False
+        return os.path.exists(POINTER_SOCKET)
+    except (OSError, ValueError):
+        return False
+
+
+def ensure_pointer():
+    """Start the virtual pointer daemon once; it lives with the service."""
+    if pointer_running():
+        return True
+    if not os.path.exists(POINTER_BIN):
+        return False
+    try:
+        runner = shutil.which("systemd-run")
+        if runner:
+            subprocess.run(
+                [runner, "--user", "--collect", "--quiet",
+                 "--unit=omarchy-remote-pointer",
+                 "--description=omarchy-remote pointer",
+                 sys.executable, POINTER_BIN],
+                capture_output=True, timeout=10)
+        else:
+            subprocess.Popen([sys.executable, POINTER_BIN],
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    for _ in range(40):
+        if os.path.exists(POINTER_SOCKET):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def pointer_command(request):
+    import socket as _socket
+    if not ensure_pointer():
+        return None
+    payload = json.dumps(request).encode("utf-8") + b"\n"
+    last_error = None
+    for attempt in range(8):
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as client:
+                client.settimeout(3)
+                client.connect(POINTER_SOCKET)
+                client.sendall(payload)
+                reply = client.recv(4096).decode("utf-8", "replace").strip()
+            if not reply:
+                last_error = "empty reply"
+                continue
+            return json.loads(reply)
+        except (OSError, ValueError) as error:
+            last_error = error
+            time.sleep(0.15 if attempt < 4 else 0.4)
+    if last_error is not None:
+        print(f"omarchy-remote: pointer failed: {last_error}", flush=True)
+    return None
+
+
+def type_text(text, key=None):
+    """Type on the computer with wtype (Wayland virtual keyboard)."""
+    wtype = shutil.which("wtype")
+    if not wtype:
+        return False
+    try:
+        if key:
+            result = subprocess.run([wtype, "-k", key], timeout=5)
+        else:
+            # stdin avoids argv length limits and shell quoting entirely.
+            result = subprocess.run([wtype, "-"], input=text, text=True, timeout=10)
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+SHORTCUT_CACHE = os.path.join(RUNTIME, "shortcuts.json")
+SHORTCUT_TTL = 120
+MODS = [(1, "SHIFT"), (4, "CTRL"), (8, "ALT"), (64, "SUPER")]
+KEY_LABELS = {
+    "RETURN": "Enter", "SPACE": "Space", "ESCAPE": "Esc", "TAB": "Tab",
+    "PRINT": "Print", "DELETE": "Delete", "BACKSPACE": "Backspace",
+    "PERIOD": "Period", "COMMA": "Comma", "MINUS": "Minus", "EQUAL": "Equal",
+    "SLASH": "Slash", "LEFT": "Left", "RIGHT": "Right", "UP": "Up", "DOWN": "Down",
+    "HOME": "Home", "END": "End", "PAGE_UP": "Page Up", "PAGE_DOWN": "Page Down",
+    "XF86AudioRaiseVolume": "Volume Up", "XF86AudioLowerVolume": "Volume Down",
+    "XF86AudioMute": "Mute", "XF86AudioMicMute": "Mic Mute",
+    "XF86AudioPlay": "Play", "XF86AudioPause": "Pause", "XF86AudioNext": "Next Track",
+    "XF86AudioPrev": "Previous Track", "XF86MonBrightnessUp": "Brightness Up",
+    "XF86MonBrightnessDown": "Brightness Down", "XF86PowerOff": "Power",
+    "XF86TouchpadToggle": "Touchpad Toggle", "XF86Eject": "Eject",
+    "XF86KbdBrightnessUp": "Keyboard Light Up",
+    "XF86KbdBrightnessDown": "Keyboard Light Down",
+    "XF86KbdLightOnOff": "Keyboard Light",
+}
+
+
+def key_label(key):
+    if not key:
+        return ""
+    if key in KEY_LABELS:
+        return KEY_LABELS[key]
+    if key.startswith("code:"):
+        return "Key " + key.split(":", 1)[1]
+    return key if len(key) <= 2 and key.isupper() else key.capitalize()
+
+
+def combo_label(modmask, key):
+    parts = [name for bit, name in MODS if int(modmask) & bit]
+    label = key_label(key)
+    if label:
+        parts.append(label)
+    return " + ".join(parts)
+
+
+def scan_shortcuts():
+    """Read the bindings out of the Omarchy Lua config.
+
+    `hyprctl binds` reports Lua binds as dispatcher `__lua`, which cannot be
+    re-dispatched. Omarchy's own keybindings menu walks the config with a stubbed
+    `hl`, so the same scanner is reused here to get the real expression or
+    command behind every chord.
+    """
+    lua = shutil.which("lua")
+    source = "/usr/share/omarchy/bin/omarchy-menu-keybindings"
+    if not lua or not os.path.exists(source):
+        return []
+
+    cache = None
+    try:
+        with open(SHORTCUT_CACHE, "r", encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except (OSError, ValueError):
+        cache = None
+    if cache and time.time() - cache.get("stamp", 0) < SHORTCUT_TTL:
+        return cache.get("items", [])
+
+    try:
+        text = open(source, encoding="utf-8").read()
+        start = text.index("<<'LUA'\n") + len("<<'LUA'\n")
+        end = text.index("\nLUA\n", start)
+        program = text[start:end]
+    except (OSError, ValueError):
+        return cache.get("items", []) if cache else []
+
+    script = os.path.join(RUNTIME, "shortcut-scan.lua")
+    try:
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(program)
+        result = subprocess.run([lua, "-E", script], capture_output=True,
+                                text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return cache.get("items", []) if cache else []
+
+    items = []
+    for line in (result.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 5:
+            continue
+        modmask, description, key, kind, arg = parts[0], parts[1], parts[2], parts[3], parts[4]
+        if not description or not kind:
+            continue
+        if key.startswith("code:"):
+            continue                    # duplicate physical-key aliases
+        items.append({
+            "keys": combo_label(modmask, key),
+            "description": description,
+            "kind": kind,
+            "arg": arg,
+        })
+
+    # One row per chord+action, keeping source order.
+    seen = set()
+    unique = []
+    for item in items:
+        marker = (item["keys"], item["description"], item["arg"])
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(item)
+
+    try:
+        ensure_runtime()
+        with open(SHORTCUT_CACHE, "w", encoding="utf-8") as handle:
+            json.dump({"stamp": time.time(), "items": unique}, handle)
+        os.chmod(SHORTCUT_CACHE, 0o600)
+    except OSError:
+        pass
+    return unique
+
+
+def lua_string(value):
+    """Quote a value as a Lua string literal."""
+    out = ['"']
+    for char in value:
+        if char in ('"', "\\"):
+            out.append("\\" + char)
+        elif char == "\n":
+            out.append("\\n")
+        else:
+            out.append(char)
+    out.append('"')
+    return "".join(out)
+
+
+def run_shortcut(item):
+    """Run one binding.
+
+    The config is Lua, so Hyprland's classic `dispatch exec <cmd>` syntax is
+    rejected; commands have to go through `hl.dsp.exec_cmd(...)`.
+    """
+    kind = item.get("kind")
+    arg = item.get("arg") or ""
+    hyprctl = shutil.which("hyprctl")
+    if not hyprctl or not arg:
+        return False
+
+    if kind == "exec":
+        expression = "hl.dsp.exec_cmd(" + lua_string(arg) + ")"
+    else:
+        expression = arg
+
+    try:
+        result = subprocess.run([hyprctl, "dispatch", expression],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = ((result.stdout or "") + (result.stderr or "")).strip()
+    if "error" in output.lower() or "ok" not in output.lower():
+        return False
+    return True
+
+
+def launch_terminal(command):
+    """Open a terminal on the computer and run the command there.
+
+    The terminal is a real window, so anything interactive (sudo's password
+    prompt, ncurses, pagers) works exactly as if the user had typed it.
+    """
+    if not command.strip():
+        return False
+    wrapper = shutil.which("omarchy-launch-floating-terminal-with-presentation")
+    try:
+        if wrapper:
+            subprocess.Popen([wrapper, command], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL)
+            return True
+
+        for terminal in ("foot", "alacritty", "kitty", "ghostty"):
+            binary = shutil.which(terminal)
+            if not binary:
+                continue
+            subprocess.Popen(
+                [binary, "-e", "bash", "-lc",
+                 command + '; echo; echo "[command finished]"'],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL)
+            return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return False
+
+
+def notifications_muted():
+    return os.path.exists(MUTE_FILE)
+
+
+def read_notifications():
+    try:
+        with open(NOTIFICATIONS_FILE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+
+def write_notifications(items):
+    with NOTIFY_LOCK:
+        for target in (NOTIFICATIONS_FILE, NOTIFICATIONS_LIVE):
+            tmp = target + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(items[:50], handle)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
+
+
+def push_action(action):
+    with NOTIFY_LOCK:
+        try:
+            actions = read_actions()
+        except Exception:
+            actions = []
+        actions.append(action)
+        tmp = NOTIFY_ACTIONS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(actions[:50], handle)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, NOTIFY_ACTIONS_FILE)
+
+
+# The keys already announced. Messengers reuse one notification key per
+# conversation and only rewrite its text, so the marker has to include the
+# content — the key alone would announce the first message and swallow the rest.
+def read_actions():
+    try:
+        with open(NOTIFY_ACTIONS_FILE, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return []
+
+
+def clear_actions():
+    with NOTIFY_LOCK:
+        try:
+            os.unlink(NOTIFY_ACTIONS_FILE)
+        except FileNotFoundError:
+            pass
+
+
+def pop_actions():
+    """Return queued actions and remove them atomically for this caller."""
+    with NOTIFY_LOCK:
+        actions = read_actions()
+        try:
+            os.unlink(NOTIFY_ACTIONS_FILE)
+        except FileNotFoundError:
+            pass
+        return actions
+
+
+def clipboard_out_state():
+    """The bar writes this file when its paste icon is pressed."""
+    try:
+        stat = os.stat(CLIPBOARD_OUT)
+        with open(CLIPBOARD_OUT, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read(1_000_000)
+        return {"id": stat.st_mtime_ns, "text": text}
+    except OSError:
+        return {"id": 0, "text": ""}
+
+
+def outbox_items():
+    items = []
+    try:
+        names = sorted(os.listdir(OUTBOX_DIR))
+    except OSError:
+        return items
+    for name in names:
+        path = os.path.join(OUTBOX_DIR, name)
+        if os.path.islink(path) or not os.path.isfile(path) or name.startswith("."):
+            continue
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        items.append({"id": name, "name": name, "size": stat.st_size})
+    return items
+
+
+def outbox_path(item_id):
+    name = safe_filename(item_id)
+    path = os.path.join(OUTBOX_DIR, name)
+    return path if os.path.isfile(path) and not os.path.islink(path) else None
+
+
+def set_volume(action, value=None):
+    if action == "up":
+        wpctl("set-volume", "-l", "1.5", "@DEFAULT_AUDIO_SINK@", "5%+")
+    elif action == "down":
+        wpctl("set-volume", "@DEFAULT_AUDIO_SINK@", "5%-")
+    elif action == "mute":
+        wpctl("set-mute", "@DEFAULT_AUDIO_SINK@", "toggle")
+    elif action == "set" and value is not None:
+        try:
+            percent = max(0, min(150, int(value)))
+        except (TypeError, ValueError):
+            return volume_state()
+        wpctl("set-volume", "@DEFAULT_AUDIO_SINK@", f"{percent}%")
+    return volume_state()
+
+
+# --------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------
+
+class Config:
+    token = ""
+    fingerprint = ""
+    bind = ""
+    port = DEFAULT_PORT
+    last_client = 0.0
+    started = 0
+
+
+def touch_client():
+    Config.last_client = time.time()
+
+
+def presence_writer():
+    path = os.path.join(RUNTIME, "presence.json")
+    while True:
+        payload = {"lastClient": int(Config.last_client),
+                   "running": True}
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+        time.sleep(2)
+
+
+def authorized(handler, _query):
+    # Header only: a token in the query string would end up in the access log
+    # and in shell history. Compare bytes so malformed/non-ASCII input cannot
+    # raise TypeError inside the request thread.
+    token = handler.headers.get("X-Token") or ""
+    try:
+        ok = bool(token) and secrets.compare_digest(
+            token.encode("utf-8"), Config.token.encode("utf-8"))
+    except (UnicodeEncodeError, TypeError):
+        ok = False
+    if ok:
+        touch_client()
+    return ok
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "omarchy-remote"
+    protocol_version = "HTTP/1.1"
+    # A client that opens a socket and sends nothing must not hold a thread
+    # forever. This is the per-read/write socket timeout.
+    timeout = 15
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, ssl.SSLError):
+            self.close_connection = True
+
+    def log_message(self, fmt, *args):
+        # The phone polls every second; without a cap service.log grows until it
+        # fills the runtime tmpfs. Keep one rotated file.
+        try:
+            if os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+        except OSError:
+            pass
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as handle:
+                handle.write("%s %s\n" % (time.strftime("%H:%M:%S"), fmt % args))
+        except OSError:
+            pass
+
+    def _send(self, code, body, ctype="application/json", extra=None):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _query(self):
+        from urllib.parse import urlparse, parse_qs
+        return parse_qs(urlparse(self.path).query)
+
+    def _json_body(self):
+        """Parse the JSON body, or raise a tagged error for the caller to send."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("bad length")
+        if length > JSON_MAX_BYTES:
+            raise OverflowError("body too large")
+        if length <= 0:
+            return {}
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, OSError):
+            raise ValueError("bad JSON")
+        return body if isinstance(body, dict) else {}
+
+    def do_GET(self):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+        query = self._query()
+
+        if path == "/health":
+            # Liveness only. The fingerprint is pairing data; an unauthenticated
+            # LAN peer has no reason to learn it.
+            return self._send(200, {"ok": True})
+        if path == "/api/state":
+            if not authorized(self, query):
+                return self._send(401, {"error": "unauthorized"})
+            state = {"media": media_state(), "volume": volume_state(),
+                     "pair": {"fingerprint": Config.fingerprint},
+                     "notificationsMuted": notifications_muted(),
+                     "disconnected": os.path.exists(DISCONNECT_FILE),
+                     "notifications": [] if notifications_muted() else read_notifications()}
+            return self._send(200, state)
+        if path == "/api/art":
+            if not authorized(self, query):
+                return self._send(401, {"error": "unauthorized"})
+            if not ART_CACHE["data"]:
+                return self._send(404, {"error": "no art"})
+            return self._send(200, ART_CACHE["data"], ART_CACHE["mime"])
+
+        if path == "/api/notify/actions":
+            if not authorized(self, query):
+                return self._send(401, {"error": "unauthorized"})
+            # Read and clear under one lock: two overlapping polls must not both
+            # execute the same reply action.
+            actions = pop_actions()
+            return self._send(200, {"actions": actions})
+
+        if path == "/api/shortcuts":
+            if not authorized(self, query):
+                return self._send(401, {"error": "unauthorized"})
+            items = scan_shortcuts()
+            rows = [{"id": index, "keys": item["keys"],
+                     "description": item["description"]}
+                    for index, item in enumerate(items)]
+            return self._send(200, {"items": rows})
+
+        if path == "/api/clipboard/out":
+            if not authorized(self, query):
+                return self._send(401, {"error": "unauthorized"})
+            return self._send(200, clipboard_out_state())
+
+        if path == "/api/outbox":
+            if not authorized(self, query):
+                return self._send(401, {"error": "unauthorized"})
+            item_id = query.get("id", [""])[0]
+            if item_id:
+                return self._send_outbox_file(item_id)
+            return self._send(200, {"items": outbox_items()})
+
+        return self._send(404, {"error": "not found"})
+
+    def _send_outbox_file(self, item_id):
+        path = outbox_path(item_id)
+        if path is None:
+            return self._send(404, {"error": "not found"})
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return self._send(404, {"error": "not found"})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            with open(path, "rb") as handle:
+                shutil.copyfileobj(handle, self.wfile, 65536)
+        except (OSError, BrokenPipeError):
+            pass
+
+    def _upload(self, query):
+        from urllib.parse import unquote
+
+        raw_name = query.get("name", ["upload"])[0]
+        name = safe_filename(unquote(raw_name))
+        header = self.headers.get("Content-Length")
+        if header is None:
+            # Chunked bodies are not decoded here; the app always sends a length.
+            return self._send(411, {"error": "length required"})
+        try:
+            length = int(header)
+        except ValueError:
+            return self._send(400, {"error": "bad length"})
+        if length <= 0:
+            return self._send(400, {"error": "empty body"})
+
+        try:
+            target, target_fd = upload_target(name)
+        except OSError as error:
+            return self._send(500, {"error": f"cannot create file: {error}"})
+        written = 0
+        try:
+            with os.fdopen(target_fd, "wb") as handle:
+                remaining = length
+                while remaining > 0:
+                    chunk = self.rfile.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    written += len(chunk)
+                    remaining -= len(chunk)
+                if remaining > 0:
+                    raise OSError("truncated upload")
+        except OSError as error:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+            return self._send(500, {"error": f"write failed: {error.strerror}"})
+
+        if written == 0:
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+            return self._send(400, {"error": "empty body"})
+
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+        return self._send(200, {"ok": True, "path": target,
+                                "bytes": written, "name": os.path.basename(target)})
+
+    def do_POST(self):
+        from urllib.parse import urlparse, unquote
+        path = urlparse(self.path).path
+        query = self._query()
+        if not authorized(self, query):
+            return self._send(401, {"error": "unauthorized"})
+
+        # File uploads arrive as raw bytes so no multipart parser is needed.
+        if path == "/api/upload":
+            return self._upload(query)
+
+        try:
+            body = self._json_body()
+        except OverflowError:
+            return self._send(413, {"error": "body too large"})
+        except ValueError:
+            return self._send(400, {"error": "bad JSON"})
+
+        if path == "/api/clipboard":
+            text = body.get("text")
+            if not isinstance(text, str) or not text:
+                return self._send(400, {"error": "empty clipboard"})
+            if len(text) > 200_000:
+                return self._send(413, {"error": "clipboard too large"})
+            if not set_clipboard(text):
+                return self._send(500, {"error": "clipboard unavailable"})
+            # Length only: the text itself stays out of the log.
+            print(f"omarchy-remote: clipboard in, {len(text)} chars", flush=True)
+            return self._send(200, {"ok": True, "chars": len(text)})
+
+        if path == "/api/type":
+            text = body.get("text")
+            key = body.get("key")
+            if key:
+                if not isinstance(key, str) or len(key) > 40:
+                    return self._send(400, {"error": "bad key"})
+                if not type_text("", key=key):
+                    return self._send(503, {"error": "keyboard unavailable"})
+                return self._send(200, {"ok": True})
+            if not isinstance(text, str) or not text:
+                return self._send(400, {"error": "empty text"})
+            if len(text) > 4000:
+                return self._send(413, {"error": "text too long"})
+            if not type_text(text):
+                return self._send(503, {"error": "keyboard unavailable"})
+            return self._send(200, {"ok": True, "chars": len(text)})
+
+        if path == "/api/pointer":
+            op = body.get("op")
+            if op not in ("move", "move_by", "click", "down", "up"):
+                return self._send(400, {"error": "bad op"})
+            request = {"op": op}
+            if op == "move":
+                try:
+                    request["x"] = max(0.0, min(1.0, float(body.get("x", 0.5))))
+                    request["y"] = max(0.0, min(1.0, float(body.get("y", 0.5))))
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "bad coordinates"})
+            elif op == "move_by":
+                try:
+                    request["dx"] = max(-4000, min(4000, int(body.get("dx", 0))))
+                    request["dy"] = max(-4000, min(4000, int(body.get("dy", 0))))
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "bad delta"})
+            else:
+                request["button"] = body.get("button", "left")
+
+            reply = pointer_command(request)
+            if reply is None:
+                return self._send(503, {"error": "pointer unavailable"})
+            return self._send(200, reply)
+
+        if path == "/api/terminal":
+            command = body.get("command")
+            if not isinstance(command, str) or not command.strip():
+                return self._send(400, {"error": "empty command"})
+            if len(command) > 4000:
+                return self._send(413, {"error": "command too long"})
+            if not launch_terminal(command):
+                return self._send(503, {"error": "no terminal available"})
+            return self._send(200, {"ok": True})
+
+        if path == "/api/shortcut":
+            try:
+                index = int(body.get("id", -1))
+            except (TypeError, ValueError):
+                return self._send(400, {"error": "bad id"})
+            items = scan_shortcuts()
+            if index < 0 or index >= len(items):
+                return self._send(404, {"error": "unknown shortcut"})
+            ok = run_shortcut(items[index])
+            return self._send(200 if ok else 500,
+                              {"ok": ok, "description": items[index]["description"]})
+
+        if path == "/api/player":
+            player_id = body.get("id")
+            if not isinstance(player_id, str) or not player_id:
+                return self._send(400, {"error": "missing id"})
+            SELECTED["id"] = player_id
+            selected = next((p for p in all_players() if p["id"] == player_id), None)
+            SELECTED["app"] = selected["app"] if selected else None
+            return self._send(200, media_state())
+
+        if path == "/api/disconnect":
+            # The phone says goodbye: stop serving so the bar shows "stopped".
+            ensure_runtime()
+            with open(DISCONNECT_FILE, "w", encoding="utf-8") as handle:
+                handle.write(str(int(time.time())))
+            touch_client()
+            self._send(200, {"ok": True})
+            threading.Thread(target=shutdown_soon, daemon=True).start()
+            return
+
+        if path == "/api/notify/mute":
+            muted = bool(body.get("muted"))
+            ensure_runtime()
+            if muted:
+                with open(MUTE_FILE, "w", encoding="utf-8") as handle:
+                    handle.write("1")
+            else:
+                try:
+                    os.unlink(MUTE_FILE)
+                except FileNotFoundError:
+                    pass
+            return self._send(200, {"muted": muted})
+
+        if path == "/api/notify":
+            items = body.get("items")
+            if not isinstance(items, list):
+                return self._send(400, {"error": "items must be a list"})
+            clean = []
+            for item in items[:50]:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", ""))[:500]
+                title = str(item.get("title", ""))[:120]
+                app = str(item.get("app", ""))[:60]
+                # Notification keys can be longer than 80 characters on apps
+                # that include a tag; truncating them made reply/mark-read miss.
+                key = str(item.get("key", ""))[:256]
+                if not key:
+                    continue
+                clean.append({"key": key, "app": app, "title": title,
+                              "text": text,
+                              # Capabilities come from the phone's real
+                              # notification actions. A calendar reminder has
+                              # neither, so the bar must not offer Reply/Read.
+                              "canReply": bool(item.get("canReply", False)),
+                              "canRead": bool(item.get("canRead", False)),
+                              "time": int(time.time())})
+            write_notifications(clean)
+            return self._send(200, {"ok": True, "count": len(clean)})
+
+        if path == "/api/notify/action":
+            kind = body.get("kind")
+            key = body.get("key")
+            if kind not in ("reply", "read") or not isinstance(key, str) or not key:
+                return self._send(400, {"error": "bad action"})
+            key = key[:256]
+            text = str(body.get("text", ""))[:2000]
+            if kind == "reply" and not text.strip():
+                return self._send(400, {"error": "empty reply"})
+            items = read_notifications()
+            target = next((i for i in items if i.get("key") == key), None)
+            # Never forward an action the notification did not advertise. This
+            # rejects the stale "Reply" that used to appear on reminders.
+            if target is None:
+                return self._send(404, {"error": "notification gone"})
+            if kind == "reply" and not target.get("canReply"):
+                return self._send(400, {"error": "reply not supported"})
+            if kind == "read" and not target.get("canRead"):
+                return self._send(400, {"error": "read not supported"})
+            action = {"kind": kind, "key": key, "text": text,
+                      "time": int(time.time())}
+            push_action(action)
+            write_notifications([i for i in items if i.get("key") != key])
+            return self._send(200, {"ok": True})
+
+        if path == "/api/outbox/ack":
+            item_id = body.get("id")
+            if not isinstance(item_id, str) or not item_id:
+                return self._send(400, {"error": "missing id"})
+            path = outbox_path(item_id)
+            if path is None:
+                return self._send(404, {"error": "not found"})
+            try:
+                os.unlink(path)
+            except OSError:
+                return self._send(500, {"error": "cannot remove"})
+            return self._send(200, {"ok": True})
+
+        if path == "/api/media":
+            active = current_player()
+            if not active:
+                return self._send(409, {"error": "no player"})
+            action = body.get("action")
+            name = active["id"]
+            if action == "playpause":
+                MEDIA.call(name, "PlayPause")
+            elif action == "next":
+                MEDIA.call(name, "Next")
+            elif action == "previous":
+                MEDIA.call(name, "Previous")
+            elif action == "seekTo":
+                try:
+                    position_ms = max(0, int(body.get("position", 0)))
+                except (TypeError, ValueError):
+                    position_ms = 0
+                # Never ask past the end: players either clamp oddly or wrap to 0.
+                length_ms = active.get("length") or 0
+                if length_ms > 0:
+                    position_ms = min(position_ms, max(0, length_ms // 1000 - 500))
+                MEDIA.set_position(name, position_ms * 1000)
+            elif action == "seek":
+                try:
+                    seconds = max(-60, min(60, int(body.get("seconds", 10))))
+                except (TypeError, ValueError):
+                    seconds = 10
+                MEDIA.call(name, "Seek", GLib.Variant("(x)", (seconds * 1_000_000,)))
+            else:
+                return self._send(400, {"error": "bad action"})
+            return self._send(200, media_state())
+
+        if path == "/api/volume":
+            action = body.get("action")
+            value = body.get("value")
+            return self._send(200, set_volume(action, value))
+
+        return self._send(404, {"error": "not found"})
+
+
+
+
+# --------------------------------------------------------------------------
+# sunucu
+# --------------------------------------------------------------------------
+
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with TLS handshakes in worker threads.
+
+    Wrapping the listening socket with SSLContext.wrap_socket() performs the
+    handshake inside accept(), in the main loop. One client that connects and
+    sends nothing then blocks every other client until TCP gives up. Accept
+    plain sockets here and handshake in the worker, under a timeout and a hard
+    cap on concurrent connections.
+    """
+
+    MAX_CONNECTIONS = 32
+    HANDSHAKE_TIMEOUT = 8
+
+    def __init__(self, server_address, handler, ssl_context):
+        self.ssl_context = ssl_context
+        super().__init__(server_address, handler)
+        self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        tls_request = None
+        try:
+            request.settimeout(self.HANDSHAKE_TIMEOUT)
+            tls_request = self.ssl_context.wrap_socket(request, server_side=True)
+            super().process_request_thread(tls_request, client_address)
+        except (OSError, ssl.SSLError):
+            self.shutdown_request(tls_request or request)
+        finally:
+            self._slots.release()
+
+
+def serve(bind, port):
+    ensure_runtime()
+    require_platform()
+    Config.bind, Config.port = bind, port
+    Config.token = os.environ.get("OMARCHY_REMOTE_TOKEN") or secrets.token_urlsafe(32)
+    Config.fingerprint = make_cert()
+
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(CERT_FILE, KEY_FILE)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    httpd = BoundedThreadingHTTPServer((bind, port), Handler, context)
+    httpd.daemon_threads = True
+
+    url = f"https://{bind}:{port}/"
+    qr = make_qr(url, Config.fingerprint)
+    with open(STATE_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"url": url, "fingerprint": Config.fingerprint,
+                   "qr": qr, "bind": bind, "port": port,
+                   "started": int(time.time())}, handle)
+    with open(PID_FILE, "w", encoding="utf-8") as handle:
+        handle.write(str(os.getpid()))
+    os.chmod(STATE_FILE, 0o600)
+    token_file = os.path.join(RUNTIME, "token")
+    with open(token_file, "w", encoding="utf-8") as handle:
+        handle.write(Config.token)
+    os.chmod(token_file, 0o600)
+
+    # Keep the QR file private; the phone reads it off the screen.
+    if qr:
+        os.chmod(qr, 0o600)
+
+    print(f"{APP}: {url}")
+    print(f"{APP}: fingerprint {Config.fingerprint}")
+    if qr:
+        print(f"{APP}: QR {qr}")
+    sys.stdout.flush()
+
+    # A new session must not inherit cards, replies, or clipboard text from the
+    # previous one: the token and certificate have changed, so the phone is a new
+    # client and old queued actions could target an unrelated notification.
+    for path in (DISCONNECT_FILE, NOTIFICATIONS_FILE, NOTIFICATIONS_LIVE,
+                 NOTIFY_ACTIONS_FILE, CLIPBOARD_OUT):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    Config.started = int(time.time())
+    threading.Thread(target=presence_writer, daemon=True).start()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+        for path in (PID_FILE, STATE_FILE, os.path.join(RUNTIME, "presence.json"),
+                     os.path.join(RUNTIME, "token")):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def shutdown_soon():
+    """Give the response a moment to flush, then end the service."""
+    time.sleep(0.4)
+    os.kill(os.getpid(), 15)
+
+
+def running_pid():
+    try:
+        pid = int(open(PID_FILE, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    # "_serve" is the private subcommand; a shell command that merely mentions
+    # the script name must not be mistaken for the daemon.
+    if not pid_matches(pid, "_serve"):
+        return None
+    return pid
+
+
+def cmd_start(args):
+    if running_pid():
+        print(f"{APP}: already running (pid {running_pid()})", file=sys.stderr)
+        return 1
+    require_platform()
+    ensure_runtime()
+    bind = args.bind or lan_ip()
+    # Spawn a fresh process instead of forking: keep the Gio/D-Bus connection clean.
+    log = open(LOG_FILE, "ab", buffering=0)
+    process = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_serve",
+         "--port", str(args.port), "--bind", bind],
+        stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+        start_new_session=True, close_fds=True)
+    log.close()
+    time.sleep(1.2)
+    if not running_pid():
+        print(f"{APP}: failed to start, see {LOG_FILE}", file=sys.stderr)
+        print(f"{APP}: process exited with {process.poll()}", file=sys.stderr)
+        return 1
+    print(f"{APP}: running (pid {running_pid()})")
+    return 0
+
+
+def cmd_stop(_args):
+    pid = running_pid()
+    if not pid:
+        print(f"{APP}: not running")
+        return 0
+    os.kill(pid, 15)
+    for _ in range(20):
+        time.sleep(0.1)
+        if not running_pid():
+            break
+    else:
+        os.kill(pid, 9)
+    for path in (PID_FILE, STATE_FILE,
+                 os.path.join(RUNTIME, "presence.json"),
+                 os.path.join(RUNTIME, "token"),
+                 CERT_FILE, KEY_FILE, QR_FILE):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    # The bar plugin watches these; an empty list removes the cards even
+    # though FileView does not report a deletion.
+    for path in (NOTIFICATIONS_FILE, NOTIFICATIONS_LIVE):
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("[]")
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    clear_actions()
+    try:
+        os.unlink(CLIPBOARD_OUT)
+    except FileNotFoundError:
+        pass
+    try:
+        with open(POINTER_PID, encoding="utf-8") as handle:
+            pointer_pid = int(handle.read().strip())
+        if pid_matches(pointer_pid, "omarchy-remote-pointer"):
+            os.kill(pointer_pid, 15)
+    except (OSError, ValueError):
+        pass
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "--user", "stop", "omarchy-remote-pointer"],
+                       capture_output=True, timeout=5)
+    print(f"{APP}: stopped")
+    return 0
+
+
+def cmd_status(_args):
+    pid = running_pid()
+    if not pid:
+        print(f"{APP}: stopped")
+        return 1
+    try:
+        state = json.load(open(STATE_FILE, encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    print(f"{APP}: running (pid {pid})")
+    print(f"url         : {state.get('url', '-')}")
+    print(f"fingerprint : {state.get('fingerprint', '-')}")
+    print(f"qr          : {state.get('qr', '-')}")
+    return 0
+
+
+def cmd_pair(_args):
+    try:
+        state = json.load(open(STATE_FILE, encoding="utf-8"))
+        token = open(os.path.join(RUNTIME, "token"), encoding="utf-8").read().strip()
+    except (OSError, ValueError):
+        print(f"{APP}: not running", file=sys.stderr)
+        return 1
+    url = state.get("url", "")
+    fp = state.get("fingerprint", "")
+    payload = f"{url}#t={token}&f={fp}"
+    print(payload, flush=True)
+    qr = state.get("qr")
+    if qr and shutil.which("qrencode"):
+        subprocess.run(["qrencode", "-t", "ANSIUTF8", payload])
+    return 0
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog=APP)
+    sub = parser.add_subparsers(dest="cmd")
+    start = sub.add_parser("start")
+    start.add_argument("--port", type=int, default=DEFAULT_PORT)
+    start.add_argument("--bind", default="")
+    serve_parser = sub.add_parser("_serve")
+    serve_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    serve_parser.add_argument("--bind", required=True)
+    sub.add_parser("stop")
+    sub.add_parser("status")
+    sub.add_parser("pair")
+    args = parser.parse_args(argv)
+
+    if args.cmd in (None, "start"):
+        if args.cmd is None:
+            args.port, args.bind = DEFAULT_PORT, ""
+        return cmd_start(args)
+    if args.cmd == "stop":
+        return cmd_stop(args)
+    if args.cmd == "_serve":
+        serve(args.bind, args.port)
+        return 0
+    if args.cmd == "status":
+        return cmd_status(args)
+    if args.cmd == "pair":
+        return cmd_pair(args)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

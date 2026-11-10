@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# omarchy-mirror — mirror the phone to this desktop and drive it with the
+# computer's keyboard and mouse.
+#
+# Uses scrcpy. Prefers a USB cable for the handshake, then switches adb to
+# wireless so later runs work without the cable. Keyboard and mouse are sent
+# as virtual HID devices, which needs no extra Android permission.
+#
+# Usage:
+#   omarchy-mirror            mirror + control
+#   omarchy-mirror --view     mirror only, no input
+#   omarchy-mirror --stop     close an existing mirror
+#   omarchy-mirror --wifi     forget the saved address and start over
+
+set -uo pipefail
+
+APP="omarchy-mirror"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-remote"
+ADDR_FILE="$STATE_DIR/mirror-address"
+LOG="${XDG_RUNTIME_DIR:-/tmp}/omarchy-mirror.log"
+PORT=5555
+TITLE="Phone Mirror"
+
+notify() {
+    command -v notify-send >/dev/null 2>&1 && notify-send -a "$APP" "$1" "$2"
+}
+
+die() {
+    notify "$APP" "$*"
+    printf '%s: %s\n' "$APP" "$*" >&2
+    exit 1
+}
+
+command -v scrcpy >/dev/null 2>&1 || die "scrcpy is not installed."
+command -v adb >/dev/null 2>&1 || die "adb is not installed."
+
+stop_existing() {
+    # Only stop our mirror window; a plain `pkill -x scrcpy` killed unrelated
+    # scrcpy sessions the user may have started themselves.
+    pkill -f -- '--window-title Phone Mirror' 2>/dev/null
+    sleep 0.4
+}
+
+case "${1:-}" in
+    --stop) stop_existing; echo "$APP: stopped"; exit 0 ;;
+    --wifi) rm -f "$ADDR_FILE" ;;
+esac
+
+VIEW_ONLY=0
+[[ "${1:-}" == "--view" ]] && VIEW_ONLY=1
+
+# Already mirroring? Just stop, so the bar icon behaves as a toggle.
+if pgrep -f -- '--window-title Phone Mirror' >/dev/null 2>&1; then
+    if (( VIEW_ONLY == 0 )) && [[ -z "${KEEP_RUNNING:-}" ]]; then
+        stop_existing
+        echo "$APP: stopped"
+        exit 0
+    fi
+fi
+
+mkdir -p "$STATE_DIR"
+
+usb_device() {
+    adb devices | awk 'NR>1 && $2=="device" && $1 !~ /:/ { print $1; exit }'
+}
+
+wireless_ready() {
+    adb devices | awk 'NR>1 && $2=="device" && $1 ~ /:/ { print $1; exit }'
+}
+
+device_ip() {
+    adb -s "$1" shell ip route 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }'
+}
+
+serial="$(usb_device)"
+
+if [[ -n $serial ]]; then
+    ip="$(device_ip "$serial")"
+    if [[ -n $ip ]]; then
+        # Leave the cable behind: switch adb to TCP and remember the address.
+        adb -s "$serial" tcpip "$PORT" >/dev/null 2>&1
+        sleep 2
+        if adb connect "$ip:$PORT" >/dev/null 2>&1; then
+            printf '%s\n' "$ip" >"$ADDR_FILE"
+        fi
+    fi
+fi
+
+# Prefer wireless once it is reachable; fall back to the cable.
+target="$(wireless_ready)"
+if [[ -z $target ]]; then
+    if [[ -f $ADDR_FILE ]]; then
+        saved="$(<"$ADDR_FILE")"
+        adb connect "$saved:$PORT" >/dev/null 2>&1
+        target="$(wireless_ready)"
+    fi
+fi
+[[ -n $target ]] || target="$(usb_device)"
+[[ -n $target ]] || die "No phone found. Connect the cable or enable wireless debugging."
+
+args=(
+    --serial "$target"
+    --window-title "$TITLE"
+    --window-x 60 --window-y 60
+    --max-size 1440
+    --video-bit-rate 16M
+    --max-fps 60
+    --stay-awake
+    --no-power-on
+    --video-codec=h264
+)
+
+if (( VIEW_ONLY == 1 )); then
+    args+=(--no-audio --keyboard=disabled --mouse=disabled)
+else
+    # Virtual HID input: works without "USB debugging (Security settings)".
+    args+=(--keyboard=uhid --mouse=uhid)
+fi
+
+printf '%s: mirroring %s\n' "$APP" "$target"
+notify "$APP" "Mirroring $target — close the window to stop."
+
+# Run scrcpy outside this process tree: the bar widget's Process ends as soon as
+# this script does, and a plain background child would be killed with it.
+if command -v systemd-run >/dev/null 2>&1; then
+    {
+        echo "[$(date +%H:%M:%S)] systemd-run starting scrcpy for $target"
+    } >>"$LOG"
+    systemd-run --user --collect --quiet \
+        --unit="omarchy-mirror-$$" \
+        --description="Phone mirror (scrcpy)" \
+        scrcpy "${args[@]}" >>"$LOG" 2>&1
+    status=$?
+    echo "[$(date +%H:%M:%S)] systemd-run exit=$status" >>"$LOG"
+    if (( status != 0 )); then
+        setsid scrcpy "${args[@]}" >>"$LOG" 2>&1 &
+    fi
+else
+    setsid scrcpy "${args[@]}" >>"$LOG" 2>&1 &
+fi
+
+sleep 1
+exit 0
