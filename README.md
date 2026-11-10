@@ -28,6 +28,10 @@ computer restarts.
 - **Files**: phone uploads land in `~/Documents/omarchy-remote/`; the optional
   Nautilus item **Send to phone** queues files for the phone. No size limit in
   either direction.
+  The tray reports both ends of the transfer: a toast when files are queued, and
+  **File delivered to phone** when the phone acknowledges that it wrote the file
+  to its storage. The phone shows a matching Android notification, so a finished
+  transfer is still visible when the app is in the background.
 - **Pairing**: the token lives in the URL fragment of the QR code and never
   crosses the network. The phone pins the service certificate by SHA-256.
 
