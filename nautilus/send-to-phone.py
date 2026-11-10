@@ -7,6 +7,7 @@ the PC's own filesystem, so there is no size limit.
 
 import os
 import shutil
+import subprocess
 
 from gi import require_version
 
@@ -34,6 +35,17 @@ def unique_target(directory, name):
         )
         counter += 1
     return target
+
+
+def notify(title, body):
+    """Best-effort desktop toast; the queue itself never depends on it."""
+    if not shutil.which("notify-send"):
+        return
+    try:
+        subprocess.run(["notify-send", "-a", APP_ID, title, body],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def service_running():
@@ -88,13 +100,22 @@ class SendToPhone(GObject.GObject, Nautilus.MenuProvider):
                 os.chmod(folder, 0o700)
             except OSError:
                 pass
+        queued = 0
         for path in paths:
             try:
                 target = unique_target(directory, os.path.basename(path))
                 shutil.copy2(path, target)
                 os.chmod(target, 0o600)
+                queued += 1
             except OSError:
                 continue
+        if queued == 0:
+            notify("Send to phone failed", "No file could be queued.")
+            return
+        if queued == 1:
+            notify("Queued for phone", os.path.basename(paths[0]))
+        else:
+            notify("Queued for phone", f"{queued} files")
         if service_running():
             return
         # Nudge the service awake so the phone can pick the file up.

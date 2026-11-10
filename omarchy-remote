@@ -876,6 +876,21 @@ def launch_terminal(command):
     return False
 
 
+def desktop_notify(title, body):
+    """Fire-and-forget desktop notification; never delays an HTTP request."""
+    if not shutil.which("notify-send"):
+        return
+
+    def run():
+        try:
+            subprocess.run(["notify-send", "-a", APP, title, body],
+                           capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def notifications_muted():
     return os.path.exists(MUTE_FILE)
 
@@ -1418,10 +1433,14 @@ class Handler(BaseHTTPRequestHandler):
             path = outbox_path(item_id)
             if path is None:
                 return self._send(404, {"error": "not found"})
+            # The phone acks only after the file is fully written to storage,
+            # so this is the moment the transfer really finished.
+            name = os.path.basename(path)
             try:
                 os.unlink(path)
             except OSError:
                 return self._send(500, {"error": "cannot remove"})
+            desktop_notify("File delivered to phone", name)
             return self._send(200, {"ok": True})
 
         if path == "/api/media":
