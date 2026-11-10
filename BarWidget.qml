@@ -238,7 +238,7 @@ BarWidget {
     anchors.fill: parent
     bar: root.bar
     text: root.iconText
-    tooltipText: root.connected ? "Phone connected" : "Phone remote"
+    tooltipText: root.connected ? "Phone connected" : "Phone remote — waiting for the phone"
     active: root.connected
     onPressed: function(b) { if (b === Qt.LeftButton) root.toggle() }
   }
@@ -286,7 +286,8 @@ BarWidget {
 
           Text {
             textFormat: Text.PlainText
-            text: !root.running ? "Service stopped" : (root.connected ? "Connected" : "Waiting for pairing")
+            text: !root.running ? "Service stopped"
+              : (root.connected ? "Connected" : "Phone not connected")
             color: root.connected ? root.accent : root.muted
             font.family: root.bar ? root.bar.fontFamily : Style.font.family
             font.pixelSize: Style.font.caption
