@@ -1297,10 +1297,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/pointer":
             op = body.get("op")
-            if op not in ("move", "move_by", "click", "down", "up"):
+            if op not in ("move", "move_by", "click", "down", "up", "scroll"):
                 return self._send(400, {"error": "bad op"})
             request = {"op": op}
-            if op == "move":
+            if op == "scroll":
+                try:
+                    ticks = int(body.get("ticks", 0))
+                except (TypeError, ValueError):
+                    return self._send(400, {"error": "bad ticks"})
+                if ticks == 0:
+                    return self._send(400, {"error": "bad ticks"})
+                request["ticks"] = max(-20, min(20, ticks))
+            elif op == "move":
                 try:
                     request["x"] = max(0.0, min(1.0, float(body.get("x", 0.5))))
                     request["y"] = max(0.0, min(1.0, float(body.get("y", 0.5))))

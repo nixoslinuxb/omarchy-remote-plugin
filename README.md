@@ -19,6 +19,9 @@ computer restarts.
   player/tab picker. The bar widget and the phone share one service.
 - **Mirror**: mirrors the phone into a window and drives it with this computer's
   keyboard and mouse (scrcpy over USB or Wi-Fi adb).
+- **Trackpad**: the phone moves this computer's pointer one-to-one and sends
+  left / middle / right clicks. Holding one finger on the pad and dragging a
+  second one up or down scrolls, through a virtual mouse wheel.
 - **Notification relay**: the phone's messaging notifications appear as cards at
   the top right, with **Reply** and **Mark read** only when that notification
   really exposes the matching action. Calendar reminders and other
