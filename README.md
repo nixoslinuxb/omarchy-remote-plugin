@@ -60,7 +60,9 @@ omarchy plugin enable yhcramo.remote --section right
 ```
 
 1. Click the new bar icon, then **Start** (play icon). A QR code appears.
-2. Install the companion app and scan that QR code.
+2. Install the companion app and scan that QR code. Once the phone connects the
+   panel shows status instead of the code; the small QR button brings it back
+   when pairing another device.
 3. Open port **8765/tcp** for your LAN, or the phone will pair but every request
    will fail. With `ufw`, replacing the subnet with yours:
 
