@@ -1745,7 +1745,9 @@ def cmd_pair(_args):
     print(payload, flush=True)
     qr = state.get("qr")
     if qr and shutil.which("qrencode"):
-        subprocess.run(["qrencode", "-t", "ANSIUTF8", payload])
+        # Same rule as make_qr: the payload carries the token, so it goes over
+        # stdin instead of argv.
+        subprocess.run(["qrencode", "-t", "ANSIUTF8"], input=payload.encode())
     return 0
 
 
