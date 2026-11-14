@@ -32,6 +32,9 @@ BarWidget {
   // the panel shows status instead, with this flag revealing the code again for
   // pairing another device or re-scanning on purpose.
   property bool showQr: false
+  // True after this computer's clipboard was handed to the service, so the
+  // paste icon can confirm it; reset whenever the panel is opened again.
+  property bool clipboardSent: false
   // Bumped only by the refresh button, so the QR image is re-read on demand.
   property int refreshTick: 0
 
@@ -45,6 +48,7 @@ BarWidget {
   readonly property bool qrVisible: qrPath !== "" && (!connected || showQr)
 
   onConnectedChanged: if (!connected) showQr = false
+  onPopupOpenChanged: if (popupOpen) clipboardSent = false
   readonly property string mutePath: runtime + "/notifications-muted"
   property bool notificationsMuted: false
   readonly property string iconText: connected ? String.fromCodePoint(0xF0119) : String.fromCodePoint(0xF0989)
@@ -77,6 +81,7 @@ BarWidget {
       startService()
       return
     }
+    clipboardSent = false
     clipper.running = true
   }
 
@@ -116,9 +121,11 @@ BarWidget {
     function mirror(): void { root.toggleMirror() }
     function showQr(): void { root.showQr = true; root.open() }
     function hideQr(): void { root.showQr = false }
+    function paste(): void { root.sendClipboard() }
     function status(): string {
       return JSON.stringify({ running: root.running, connected: root.connected,
-                              url: root.service.url || "", qr: root.qrPath })
+                              url: root.service.url || "", qr: root.qrPath,
+                              clipboardSent: root.clipboardSent })
     }
   }
 
@@ -208,9 +215,18 @@ BarWidget {
   Process {
     id: clipper
     command: ["bash", "-c",
-      "mkdir -p \"$1\" && tmp=\"$1/.clip.$$\" && timeout 5 wl-paste --no-newline 2>/dev/null | head -c 1000000 > \"$tmp\" && mv -f \"$tmp\" \"$1/clipboard-out.txt\" || rm -f \"$tmp\"",
+      "mkdir -p \"$1\" || exit 1\n" +
+      "tmp=\"$1/.clip.$$\"\n" +
+      "timeout 5 wl-paste --no-newline 2>/dev/null | head -c 1000000 > \"$tmp\" || { rm -f \"$tmp\"; exit 1; }\n" +
+      "[ -s \"$tmp\" ] || { rm -f \"$tmp\"; exit 1; }\n" +
+      "mv -f \"$tmp\" \"$1/clipboard-out.txt\"",
       "omarchy-remote-clip", root.runtime]
-    onRunningChanged: if (!running) settle.restart()
+    // Only a real, non-empty clipboard counts as sent; an empty or failed
+    // wl-paste exits non-zero so the icon does not lie.
+    onExited: function (code, status) {
+      if (code === 0) root.clipboardSent = true
+      settle.restart()
+    }
   }
 
   // Flips the notification-mute marker the service reads.
@@ -454,8 +470,11 @@ BarWidget {
           }
 
           GlassIconButton {
-            iconSource: Qt.resolvedUrl("icons/clipboard.svg")
-            tooltip: "Send this computer's clipboard to the phone"
+            iconSource: Qt.resolvedUrl(root.clipboardSent ? "icons/clipboard-sent.svg" : "icons/clipboard.svg")
+            tooltip: root.clipboardSent
+              ? "Clipboard sent to the phone"
+              : "Send this computer's clipboard to the phone"
+            active: root.clipboardSent
             onClicked: root.sendClipboard()
           }
 
