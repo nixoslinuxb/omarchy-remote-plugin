@@ -19,6 +19,9 @@ computer restarts.
   player/tab picker. The bar widget and the phone share one service.
 - **Mirror**: mirrors the phone into a window and drives it with this computer's
   keyboard and mouse (scrcpy over USB or Wi-Fi adb).
+- **Shortcuts and typing**: the phone lists every Omarchy binding and runs it
+  on this computer, and can also send in-app chords such as Ctrl+W or Ctrl+Tab
+  to the focused window with `wtype`.
 - **Trackpad**: the phone moves this computer's pointer one-to-one and sends
   left / middle / right clicks. Holding one finger on the pad and dragging a
   second one up or down scrolls, through a virtual mouse wheel.

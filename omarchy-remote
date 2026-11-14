@@ -671,14 +671,27 @@ def pointer_command(request):
     return None
 
 
-def type_text(text, key=None):
+KEY_MODIFIERS = {"ctrl": "ctrl", "shift": "shift", "alt": "alt", "super": "logo"}
+
+
+def type_text(text, key=None, mods=None):
     """Type on the computer with wtype (Wayland virtual keyboard)."""
     wtype = shutil.which("wtype")
     if not wtype:
         return False
     try:
         if key:
-            result = subprocess.run([wtype, "-k", key], timeout=5)
+            args = [wtype]
+            # Press the modifiers in a fixed order, then the key, then release
+            # them in reverse; wtype applies them to the focused window.
+            held = [KEY_MODIFIERS[m] for m in ("ctrl", "shift", "alt", "super")
+                    if m in (mods or ())]
+            for modifier in held:
+                args += ["-M", modifier]
+            args += ["-k", key]
+            for modifier in reversed(held):
+                args += ["-m", modifier]
+            result = subprocess.run(args, timeout=5)
         else:
             # stdin avoids argv length limits and shell quoting entirely.
             result = subprocess.run([wtype, "-"], input=text, text=True, timeout=10)
@@ -1284,7 +1297,13 @@ class Handler(BaseHTTPRequestHandler):
             if key:
                 if not isinstance(key, str) or len(key) > 40:
                     return self._send(400, {"error": "bad key"})
-                if not type_text("", key=key):
+                raw_mods = body.get("mods") or []
+                if not isinstance(raw_mods, list):
+                    return self._send(400, {"error": "bad mods"})
+                mods = [m for m in raw_mods if isinstance(m, str) and m in KEY_MODIFIERS]
+                if len(mods) != len(raw_mods):
+                    return self._send(400, {"error": "bad mods"})
+                if not type_text("", key=key, mods=mods):
                     return self._send(503, {"error": "keyboard unavailable"})
                 return self._send(200, {"ok": True})
             if not isinstance(text, str) or not text:
