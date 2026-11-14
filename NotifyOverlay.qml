@@ -101,22 +101,34 @@ PanelWindow {
   function sendAction(kind, key, text) {
     if (!token || !key || !stateBind) return
     var payload = JSON.stringify({ kind: kind, key: key, text: text || "" })
-    // Never put the token or the reply text in argv (visible in ps), and never
-    // use curl -k: the certificate is pinned by the service's own cert.pem.
+    // Never put the token or the reply text in argv. `curl -H "X-Token: ..."`
+    // expands the variable before exec, so the token would still show up in
+    // curl's own cmdline; both the header and the body go through 0600 files
+    // in the private runtime directory instead.
     actionProc.environment = {
       OR_TOKEN: token,
       OR_PAYLOAD: payload,
       OR_CERT: runtime + "/cert.pem",
       OR_BIND: stateBind,
-      OR_PORT: String(statePort)
+      OR_PORT: String(statePort),
+      OR_RUNTIME: runtime
     }
     actionProc.command = ["bash", "-c",
-      'exec curl -sS --max-time 8 --cacert "$OR_CERT" ' +
+      'set -u\n' +
+      'umask 077\n' +
+      'hdr="$OR_RUNTIME/.action-header.$$"\n' +
+      'body="$OR_RUNTIME/.action-body.$$"\n' +
+      // No exec: replacing the shell would skip the trap and leak the files.
+      'trap \'rm -f "$hdr" "$body"\' EXIT\n' +
+      'printf \'X-Token: %s\\n\' "$OR_TOKEN" > "$hdr" || exit 1\n' +
+      'printf \'%s\' "$OR_PAYLOAD" > "$body" || exit 1\n' +
+      'curl -sS --max-time 8 --cacert "$OR_CERT" ' +
       '--connect-to "127.0.0.1:$OR_PORT:$OR_BIND:$OR_PORT" ' +
-      '-H "X-Token: $OR_TOKEN" ' +
+      '-H @"$hdr" ' +
       '-H "Content-Type: application/json" ' +
-      '--data-binary "$OR_PAYLOAD" ' +
-      '"https://127.0.0.1:$OR_PORT/api/notify/action"']
+      '--data-binary @"$body" ' +
+      '"https://127.0.0.1:$OR_PORT/api/notify/action"\n' +
+      'exit $?']
     actionProc.running = true
   }
 

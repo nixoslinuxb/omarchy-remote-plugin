@@ -129,8 +129,11 @@ def make_qr(url, fingerprint_value):
     if not shutil.which("qrencode"):
         return None
     payload = f"{url}#t={Config.token}&f={fingerprint_value}"
-    subprocess.run(["qrencode", "-o", QR_FILE, "-s", "7", "-m", "3", payload],
-                   check=True)
+    # The payload carries the pairing token. Pass it on stdin: an argument is
+    # visible to every local user through /proc/<pid>/cmdline, even though the
+    # helper only lives for a moment.
+    subprocess.run(["qrencode", "-o", QR_FILE, "-s", "7", "-m", "3"],
+                   input=payload.encode(), check=True)
     return QR_FILE
 
 
