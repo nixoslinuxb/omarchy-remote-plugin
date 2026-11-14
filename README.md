@@ -30,7 +30,9 @@ computer restarts.
   really exposes the matching action. Calendar reminders and other
   non-conversation cards show no buttons. The bell icon silences the relay.
 - **Clipboard, both ways**: paste into this computer's Wayland clipboard, and
-  publish this computer's clipboard for the phone.
+  publish this computer's clipboard for the phone. The paste icon turns into a
+  check mark once the hand-off succeeded, and returns to its normal state the
+  next time the panel is opened.
 - **Files**: phone uploads land in `~/Documents/omarchy-remote/`; the optional
   Nautilus item **Send to phone** queues files for the phone. No size limit in
   either direction.
