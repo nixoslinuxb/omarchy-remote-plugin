@@ -114,6 +114,8 @@ BarWidget {
     function close(): void { root.close() }
     function toggle(): void { root.toggle() }
     function mirror(): void { root.toggleMirror() }
+    function showQr(): void { root.showQr = true; root.open() }
+    function hideQr(): void { root.showQr = false }
     function status(): string {
       return JSON.stringify({ running: root.running, connected: root.connected,
                               url: root.service.url || "", qr: root.qrPath })
