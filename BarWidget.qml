@@ -28,6 +28,10 @@ BarWidget {
   property var presence: ({})
   property bool popupOpen: false
   property bool starting: false
+  // The QR is only pairing information. Once a phone is talking to the service
+  // the panel shows status instead, with this flag revealing the code again for
+  // pairing another device or re-scanning on purpose.
+  property bool showQr: false
   // Bumped only by the refresh button, so the QR image is re-read on demand.
   property int refreshTick: 0
 
@@ -37,6 +41,10 @@ BarWidget {
     return running && last > 0 && (Date.now() / 1000 - last) < 6
   }
   readonly property string qrPath: service.qr || ""
+  // Hide the pairing code while a phone is actually attached.
+  readonly property bool qrVisible: qrPath !== "" && (!connected || showQr)
+
+  onConnectedChanged: if (!connected) showQr = false
   readonly property string mutePath: runtime + "/notifications-muted"
   property bool notificationsMuted: false
   readonly property string iconText: connected ? String.fromCodePoint(0xF0119) : String.fromCodePoint(0xF0989)
@@ -297,16 +305,17 @@ BarWidget {
 
       PanelSeparator { foreground: root.foreground }
 
-      // QR
+      // QR — only while nothing is connected, or when the user asks for it.
       Item {
         width: parent.width
-        implicitHeight: Style.space(212)
+        visible: root.connected && !root.showQr ? false : true
+        implicitHeight: visible ? Style.space(212) : 0
 
         Rectangle {
           anchors.fill: parent
           color: "#ffffff"
           radius: Style.space(8)
-          visible: root.qrPath !== ""
+          visible: root.qrVisible
         }
 
         Image {
@@ -318,7 +327,7 @@ BarWidget {
           fillMode: Image.PreserveAspectFit
           smooth: false
           cache: false
-          visible: root.qrPath !== ""
+          visible: root.qrVisible
         }
 
         Text {
@@ -332,14 +341,63 @@ BarWidget {
         }
       }
 
+      // Connected: no QR, just a quiet way to bring it back.
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.connected && !root.showQr
+
+        Text {
+          textFormat: Text.PlainText
+          text: "A phone is connected. The QR code is only needed to pair a device."
+          color: root.muted
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+          wrapMode: Text.WordWrap
+          width: parent.width - Style.space(56)
+        }
+
+        GlassIconButton {
+          iconSource: Qt.resolvedUrl("icons/qr.svg")
+          tooltip: "Show the pairing QR code"
+          onClicked: root.showQr = true
+        }
+      }
+
       Text {
         textFormat: Text.PlainText
-        text: "Scan the QR with your phone camera. Both devices must be on the same Wi-Fi."
+        text: root.connected && !root.showQr
+          ? "Both devices must be on the same Wi-Fi."
+          : "Scan the QR with your phone camera. Both devices must be on the same Wi-Fi."
         color: root.muted
         font.family: root.bar ? root.bar.fontFamily : Style.font.family
         font.pixelSize: Style.font.caption
         wrapMode: Text.WordWrap
         width: parent.width
+      }
+
+      // While the code is shown on purpose, offer a way back to the compact view.
+      Row {
+        width: parent.width
+        spacing: Style.space(8)
+        visible: root.connected && root.showQr
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Hide the pairing code"
+          color: root.muted
+          font.family: root.bar ? root.bar.fontFamily : Style.font.family
+          font.pixelSize: Style.font.caption
+          anchors.verticalCenter: parent.verticalCenter
+          width: parent.width - Style.space(56)
+        }
+
+        GlassIconButton {
+          iconSource: Qt.resolvedUrl("icons/qr.svg")
+          tooltip: "Hide the pairing QR code"
+          active: true
+          onClicked: root.showQr = false
+        }
       }
 
       // Kept in the layout when the service stops, so the action row does not
