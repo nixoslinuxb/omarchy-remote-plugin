@@ -98,6 +98,20 @@ def notify(title, body):
         pass
 
 
+def service_binary():
+    """Path to the service shipped inside the installed plugin.
+
+    A marketplace install keeps everything in the plugin directory, so there is
+    no `omarchy-remote` on PATH. Only fall back to PATH for a hand-made layout
+    that still copies the script into ~/.local/bin.
+    """
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    bundled = os.path.join(config, "omarchy", "plugins", APP_ID, "omarchy-remote")
+    if os.path.isfile(bundled):
+        return bundled
+    return shutil.which("omarchy-remote")
+
+
 def service_running():
     runtime = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
     pid_path = os.path.join(runtime, "omarchy-remote", "pid")
@@ -197,6 +211,6 @@ class SendToPhone(GObject.GObject, Nautilus.MenuProvider):
         if service_running():
             return
         # Nudge the service awake so the phone can pick the file up.
-        binary = shutil.which("omarchy-remote")
+        binary = service_binary()
         if binary:
             Gio.Subprocess.new([binary, "start"], Gio.SubprocessFlags.NONE)
