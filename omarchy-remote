@@ -26,6 +26,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -1072,12 +1073,75 @@ def authorized(handler, _query):
     return ok
 
 
+class _HeaderLimit:
+    """Read-through wrapper that refuses to buffer more than `limit` bytes.
+
+    Used only while the request line and headers are parsed, so an unauthenticated
+    peer cannot stream an unlimited header block into memory.
+    """
+
+    def __init__(self, stream, limit):
+        self._stream = stream
+        self._left = limit
+
+    @property
+    def exhausted(self):
+        return self._left <= 0
+
+    def readline(self, size=-1):
+        if self._left <= 0:
+            return b""
+        want = self._left if size is None or size < 0 else min(size, self._left)
+        data = self._stream.readline(want)
+        self._left -= len(data)
+        return data
+
+    def read(self, size=-1):
+        if self._left <= 0:
+            return b""
+        want = self._left if size is None or size < 0 else min(size, self._left)
+        data = self._stream.read(want)
+        self._left -= len(data)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "omarchy-remote"
     protocol_version = "HTTP/1.1"
     # A client that opens a socket and sends nothing must not hold a thread
-    # forever. This is the per-read/write socket timeout.
+    # forever. This is the per-read/write socket timeout, backed by the
+    # server's absolute pre-auth deadline.
     timeout = 15
+    MAX_HEADER_BYTES = 32 * 1024
+    MAX_HEADER_COUNT = 64
+
+    def parse_request(self):
+        # Bound the unauthenticated phase: a fixed byte budget for the request
+        # line plus headers, and drop the server's absolute deadline as soon as
+        # the headers are in.
+        stream = self.rfile
+        limited = _HeaderLimit(stream, self.MAX_HEADER_BYTES)
+        self.rfile = limited
+        try:
+            ok = super().parse_request()
+        finally:
+            self.rfile = stream
+            try:
+                self.server.clear_deadline(self.connection)
+            except AttributeError:
+                pass
+        if ok and limited.exhausted:
+            # The budget ran out inside the header block, so what was parsed is
+            # a prefix, not the real request.
+            self.send_error(431, "Request header too large")
+            return False
+        if ok and len(self.headers) > self.MAX_HEADER_COUNT:
+            self.send_error(431, "Too many headers")
+            return False
+        return ok
 
     def handle_one_request(self):
         try:
@@ -1527,23 +1591,93 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
     sends nothing then blocks every other client until TCP gives up. Accept
     plain sockets here and handshake in the worker, under a timeout and a hard
     cap on concurrent connections.
+
+    The cap alone was not enough: a peer could hold all slots by trickling one
+    byte at a time, because a socket timeout restarts on every read. Every
+    connection therefore also gets an absolute deadline that covers the TLS
+    handshake and the request headers, and a watchdog closes it when the
+    deadline passes.
     """
 
     MAX_CONNECTIONS = 32
+    # One peer must not be able to take every slot; a LAN attacker is a single
+    # address, while the phone is another.
+    MAX_CONNECTIONS_PER_PEER = 8
     HANDSHAKE_TIMEOUT = 8
+    # Handshake plus request line plus headers, measured from accept.
+    PRE_AUTH_DEADLINE = 20
 
     def __init__(self, server_address, handler, ssl_context):
         self.ssl_context = ssl_context
+        self._deadlines = {}
+        self._deadlines_lock = threading.Lock()
+        self._per_peer = {}
         super().__init__(server_address, handler)
         self._slots = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        threading.Thread(target=self._reap, daemon=True).start()
+
+    def _peer_key(self, client_address):
+        return client_address[0] if client_address else "?"
+
+    def _reap(self):
+        while True:
+            time.sleep(0.5)
+            now = time.monotonic()
+            with self._deadlines_lock:
+                for key, (sock, deadline, peer) in list(self._deadlines.items()):
+                    if deadline <= now:
+                        del self._deadlines[key]
+                        self._per_peer[peer] = self._per_peer.get(peer, 1) - 1
+                        if self._per_peer[peer] <= 0:
+                            del self._per_peer[peer]
+                        try:
+                            sock.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+
+    def _forget_peer(self, peer):
+        with self._deadlines_lock:
+            self._per_peer[peer] = self._per_peer.get(peer, 1) - 1
+            if self._per_peer[peer] <= 0:
+                del self._per_peer[peer]
+
+    def defer_deadline(self, old_sock, new_sock):
+        """Move the pre-auth deadline onto the TLS-wrapped socket."""
+        with self._deadlines_lock:
+            entry = self._deadlines.pop(id(old_sock), None)
+            if entry is not None:
+                self._deadlines[id(new_sock)] = (new_sock, entry[1], entry[2])
+
+    def clear_deadline(self, sock):
+        """The request is authenticated or over: drop the absolute deadline."""
+        with self._deadlines_lock:
+            entry = self._deadlines.pop(id(sock), None)
+            if entry is not None:
+                peer = entry[2]
+                self._per_peer[peer] = self._per_peer.get(peer, 1) - 1
+                if self._per_peer[peer] <= 0:
+                    del self._per_peer[peer]
 
     def process_request(self, request, client_address):
+        peer = self._peer_key(client_address)
+        with self._deadlines_lock:
+            active = self._per_peer.get(peer, 0)
+            if active >= self.MAX_CONNECTIONS_PER_PEER:
+                # One address may not exhaust the shared pool.
+                self.shutdown_request(request)
+                return
+            self._per_peer[peer] = active + 1
         if not self._slots.acquire(blocking=False):
+            self._forget_peer(peer)
             self.shutdown_request(request)
             return
+        with self._deadlines_lock:
+            self._deadlines[id(request)] = (
+                request, time.monotonic() + self.PRE_AUTH_DEADLINE, peer)
         try:
             super().process_request(request, client_address)
         except Exception:
+            self.clear_deadline(request)
             self._slots.release()
             raise
 
@@ -1552,10 +1686,12 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         try:
             request.settimeout(self.HANDSHAKE_TIMEOUT)
             tls_request = self.ssl_context.wrap_socket(request, server_side=True)
+            self.defer_deadline(request, tls_request)
             super().process_request_thread(tls_request, client_address)
         except (OSError, ssl.SSLError):
             self.shutdown_request(tls_request or request)
         finally:
+            self.clear_deadline(tls_request or request)
             self._slots.release()
 
 
