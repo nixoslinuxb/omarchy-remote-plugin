@@ -1128,11 +1128,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             ok = super().parse_request()
         finally:
+            # The absolute deadline stays: only a successful token check, or the
+            # end of the connection, may drop it. Clearing it here let an
+            # unauthenticated HTTP/1.1 connection sit idle holding a worker.
             self.rfile = stream
-            try:
-                self.server.clear_deadline(self.connection)
-            except AttributeError:
-                pass
         if ok and limited.exhausted:
             # The budget ran out inside the header block, so what was parsed is
             # a prefix, not the real request.
@@ -1142,6 +1141,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(431, "Too many headers")
             return False
         return ok
+
+    def _require_auth(self, query):
+        """Check the token and, only then, retire the absolute deadline.
+
+        An unauthenticated response always closes the connection, so a rejected
+        or public request cannot keep a worker slot alive through HTTP/1.1
+        keep-alive.
+        """
+        if not authorized(self, query):
+            self.close_connection = True
+            return False
+        try:
+            self.server.clear_deadline(self.connection)
+        except AttributeError:
+            pass
+        return True
 
     def handle_one_request(self):
         try:
@@ -1173,6 +1188,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        if self.close_connection:
+            # Say it explicitly: an unauthenticated reply must not look reusable
+            # to an HTTP/1.1 client.
+            self.send_header("Connection", "close")
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -1205,10 +1224,12 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/health":
             # Liveness only. The fingerprint is pairing data; an unauthenticated
-            # LAN peer has no reason to learn it.
+            # LAN peer has no reason to learn it. Close after answering so an
+            # HTTP/1.1 keep-alive cannot pin a worker without a token.
+            self.close_connection = True
             return self._send(200, {"ok": True})
         if path == "/api/state":
-            if not authorized(self, query):
+            if not self._require_auth(query):
                 return self._send(401, {"error": "unauthorized"})
             state = {"media": media_state(), "volume": volume_state(),
                      "pair": {"fingerprint": Config.fingerprint},
@@ -1217,14 +1238,14 @@ class Handler(BaseHTTPRequestHandler):
                      "notifications": [] if notifications_muted() else read_notifications()}
             return self._send(200, state)
         if path == "/api/art":
-            if not authorized(self, query):
+            if not self._require_auth(query):
                 return self._send(401, {"error": "unauthorized"})
             if not ART_CACHE["data"]:
                 return self._send(404, {"error": "no art"})
             return self._send(200, ART_CACHE["data"], ART_CACHE["mime"])
 
         if path == "/api/notify/actions":
-            if not authorized(self, query):
+            if not self._require_auth(query):
                 return self._send(401, {"error": "unauthorized"})
             # Read and clear under one lock: two overlapping polls must not both
             # execute the same reply action.
@@ -1232,7 +1253,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"actions": actions})
 
         if path == "/api/shortcuts":
-            if not authorized(self, query):
+            if not self._require_auth(query):
                 return self._send(401, {"error": "unauthorized"})
             items = scan_shortcuts()
             rows = [{"id": index, "keys": item["keys"],
@@ -1241,18 +1262,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"items": rows})
 
         if path == "/api/clipboard/out":
-            if not authorized(self, query):
+            if not self._require_auth(query):
                 return self._send(401, {"error": "unauthorized"})
             return self._send(200, clipboard_out_state())
 
         if path == "/api/outbox":
-            if not authorized(self, query):
+            if not self._require_auth(query):
                 return self._send(401, {"error": "unauthorized"})
             item_id = query.get("id", [""])[0]
             if item_id:
                 return self._send_outbox_file(item_id)
             return self._send(200, {"items": outbox_items()})
 
+        # Unknown path, never authenticated: do not keep the connection open.
+        self.close_connection = True
         return self._send(404, {"error": "not found"})
 
     def _send_outbox_file(self, item_id):
@@ -1332,7 +1355,7 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import urlparse, unquote
         path = urlparse(self.path).path
         query = self._query()
-        if not authorized(self, query):
+        if not self._require_auth(query):
             return self._send(401, {"error": "unauthorized"})
 
         # File uploads arrive as raw bytes so no multipart parser is needed.
@@ -1626,20 +1649,14 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             with self._deadlines_lock:
                 for key, (sock, deadline, peer) in list(self._deadlines.items()):
                     if deadline <= now:
+                        # Close the socket, but leave the per-peer count alone:
+                        # the worker that owns this connection decrements it
+                        # exactly once when it releases the shared slot.
                         del self._deadlines[key]
-                        self._per_peer[peer] = self._per_peer.get(peer, 1) - 1
-                        if self._per_peer[peer] <= 0:
-                            del self._per_peer[peer]
                         try:
                             sock.shutdown(socket.SHUT_RDWR)
                         except OSError:
                             pass
-
-    def _forget_peer(self, peer):
-        with self._deadlines_lock:
-            self._per_peer[peer] = self._per_peer.get(peer, 1) - 1
-            if self._per_peer[peer] <= 0:
-                del self._per_peer[peer]
 
     def defer_deadline(self, old_sock, new_sock):
         """Move the pre-auth deadline onto the TLS-wrapped socket."""
@@ -1649,14 +1666,21 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
                 self._deadlines[id(new_sock)] = (new_sock, entry[1], entry[2])
 
     def clear_deadline(self, sock):
-        """The request is authenticated or over: drop the absolute deadline."""
+        """Authentication succeeded, or the connection is finished.
+
+        Only the absolute deadline is removed. The per-peer count belongs to the
+        worker slot and is released in `_forget_peer` when that slot is freed.
+        """
         with self._deadlines_lock:
-            entry = self._deadlines.pop(id(sock), None)
-            if entry is not None:
-                peer = entry[2]
-                self._per_peer[peer] = self._per_peer.get(peer, 1) - 1
-                if self._per_peer[peer] <= 0:
-                    del self._per_peer[peer]
+            self._deadlines.pop(id(sock), None)
+
+    def _forget_peer(self, peer, request=None):
+        if request is not None:
+            self.clear_deadline(request)
+        with self._deadlines_lock:
+            self._per_peer[peer] = self._per_peer.get(peer, 1) - 1
+            if self._per_peer[peer] <= 0:
+                del self._per_peer[peer]
 
     def process_request(self, request, client_address):
         peer = self._peer_key(client_address)
@@ -1677,11 +1701,12 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         try:
             super().process_request(request, client_address)
         except Exception:
-            self.clear_deadline(request)
+            self._forget_peer(peer, request)
             self._slots.release()
             raise
 
     def process_request_thread(self, request, client_address):
+        peer = self._peer_key(client_address)
         tls_request = None
         try:
             request.settimeout(self.HANDSHAKE_TIMEOUT)
@@ -1691,7 +1716,9 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
         except (OSError, ssl.SSLError):
             self.shutdown_request(tls_request or request)
         finally:
-            self.clear_deadline(tls_request or request)
+            # The deadline goes with the connection; the peer count goes with
+            # the shared slot, which is released here and nowhere else.
+            self._forget_peer(peer, tls_request or request)
             self._slots.release()
 
 
